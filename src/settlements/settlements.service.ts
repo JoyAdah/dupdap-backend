@@ -34,6 +34,20 @@ const MAX_BATCH_PAYMENT_COUNT = 50;
 const BATCH_WINDOW_MINUTES = 15;
 const BATCH_FEE_RATE = 0.015;
 
+/**
+ * Maps a merchant's country to the fiat currency their settlements are
+ * denominated in. Falls back to USD for unknown countries so we never
+ * silently record a settlement in the wrong currency.
+ */
+const COUNTRY_TO_SETTLEMENT_CURRENCY: Record<string, string> = {
+  NG: 'NGN',
+  US: 'USD',
+  GB: 'GBP',
+  AU: 'AUD',
+};
+
+const DEFAULT_SETTLEMENT_CURRENCY = 'USD';
+
 @Injectable()
 export class SettlementsService {
   private readonly logger = new Logger(SettlementsService.name);
@@ -65,6 +79,28 @@ export class SettlementsService {
     return new Big(value);
   }
 
+  /**
+   * Resolves the fiat currency a merchant's settlements should be denominated
+   * in, based on the merchant's country. Never hardcodes a single currency.
+   */
+  private async resolveSettlementCurrency(merchantId: string): Promise<string> {
+    try {
+      const merchant = await this.merchantsService.findOne(merchantId);
+      const country = merchant?.country?.toUpperCase();
+      if (country && COUNTRY_TO_SETTLEMENT_CURRENCY[country]) {
+        return COUNTRY_TO_SETTLEMENT_CURRENCY[country];
+      }
+      this.logger.warn(
+        `No settlement currency mapping for merchant ${merchantId} (country: ${merchant?.country ?? 'unknown'}); defaulting to ${DEFAULT_SETTLEMENT_CURRENCY}`,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to resolve settlement currency for merchant ${merchantId}; defaulting to ${DEFAULT_SETTLEMENT_CURRENCY}`,
+      );
+    }
+    return DEFAULT_SETTLEMENT_CURRENCY;
+  }
+
   async initiateSettlement(payment: Payment): Promise<void> {
     const amountUsd = this.toBig(payment.amountUsd);
     if (amountUsd.lt(SMALL_BATCH_THRESHOLD_USD)) {
@@ -78,12 +114,14 @@ export class SettlementsService {
     const netUsd = amountUsd.minus(feeUsd);
     const LARGE_SETTLEMENT_THRESHOLD = 10000;
 
+    const fiatCurrency = await this.resolveSettlementCurrency(payment.merchantId);
+
     const settlement = this.settlementsRepo.create({
       merchantId: payment.merchantId,
       totalAmountUsd: amountUsd.toNumber(),
       feeAmountUsd: feeUsd.toNumber(),
       netAmountUsd: netUsd.toNumber(),
-      fiatCurrency: 'NGN',
+      fiatCurrency,
       status: netUsd.gte(LARGE_SETTLEMENT_THRESHOLD) ? SettlementStatus.PENDING_APPROVAL : SettlementStatus.PROCESSING,
       requiresApproval: netUsd.gte(LARGE_SETTLEMENT_THRESHOLD),
     });
@@ -198,12 +236,14 @@ export class SettlementsService {
     const feeAmountUsd = totalAmountUsd.times(BATCH_FEE_RATE);
     const netAmountUsd = totalAmountUsd.minus(feeAmountUsd);
 
+    const fiatCurrency = await this.resolveSettlementCurrency(payments[0].merchantId);
+
     const settlement = this.settlementsRepo.create({
       merchantId: payments[0].merchantId,
       totalAmountUsd: totalAmountUsd.toNumber(),
       feeAmountUsd: feeAmountUsd.toNumber(),
       netAmountUsd: netAmountUsd.toNumber(),
-      fiatCurrency: 'NGN',
+      fiatCurrency,
       status: netAmountUsd.gte(10000) ? SettlementStatus.PENDING_APPROVAL : SettlementStatus.PROCESSING,
       requiresApproval: netAmountUsd.gte(10000),
     });
@@ -214,23 +254,26 @@ export class SettlementsService {
       payment.status = PaymentStatus.SETTLING;
       payment.feeUsd = this.toBig(payment.amountUsd).times(BATCH_FEE_RATE).toNumber();
       payment.settlementId = saved.id;
-      await this.paymentsRepo.save(payment);
     }
 
-    this.logger.debug(
-      `Created batch settlement ${saved.id} for merchant ${saved.merchantId} with ${payments.length} payments totaling $${totalAmountUsd.toFixed(2)}`,
-    );
+    await this.paymentsRepo.save(payments);
 
-    if (saved.status === SettlementStatus.PROCESSING) {
+    await this.webhooks.dispatch(payments[0].merchantId, 'settlement.created', {
+      settlementId: saved.id,
+      paymentIds: payments.map((p) => p.id),
+      fiatCurrency: saved.fiatCurrency,
+    });
+
+    if (!saved.requiresApproval) {
       await this.enqueueSettlement(saved.id);
     } else {
       await this.adminAlerts.raise({
         type: AdminAlertType.SETTLEMENT_FAILURE,
         dedupeKey: `large-settlement:${saved.id}`,
-        message: `Batch settlement ${saved.id} requires manual approval: $${netAmountUsd.toFixed(2)}`,
+        message: `Large batch settlement ${saved.id} requires manual approval: $${netAmountUsd.toFixed(2)}`,
         metadata: {
           merchantId: saved.merchantId,
-          paymentCount: payments.length,
+          paymentIds: payments.map((p) => p.id),
           amount: netAmountUsd.toNumber(),
         },
         thresholdValue: 1,
@@ -238,361 +281,173 @@ export class SettlementsService {
     }
   }
 
-  private async settleSettlementPayments(settlement: Settlement): Promise<void> {
-    const payments = settlement.payments ?? [];
+  private async executeFiatTransfer(settlement: Settlement): Promise<void> {
+    const partnerUrl = this.config.get<string>('SETTLEMENT_PARTNER_URL');
+    const partnerApiKey = this.config.get<string>('SETTLEMENT_PARTNER_API_KEY');
 
-    for (const payment of payments) {
-      await this.stellar.invokeContract('settle', [payment.id, settlement.id]);
-      payment.status = PaymentStatus.SETTLED;
-      await this.paymentsRepo.save(payment);
+    if (!partnerUrl || !partnerApiKey) {
+      throw new Error('Settlement partner is not configured');
     }
 
-    this.invalidateAnalyticsForMerchant(settlement.merchantId);
-
-    for (const payment of payments) {
-      await this.webhooks.dispatch(settlement.merchantId, 'payment.settled', {
-        paymentId: payment.id,
-        settlementId: settlement.id,
-        amount: payment.amountUsd,
-      });
-
-      await this.sendSettlementEmail(
-        settlement.merchantId,
-        NotificationEventType.PAYMENT_SETTLED,
-        'settlement-completed',
-        {
-          settlementId: settlement.id,
-          netAmountUsd: Number(settlement.netAmountUsd).toFixed(2),
-          paymentId: payment.id,
+    await axios.post(
+      `${partnerUrl}/transfers`,
+      {
+        reference: settlement.id,
+        amount: settlement.netAmountUsd,
+        currency: settlement.fiatCurrency,
+        merchantId: settlement.merchantId,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${partnerApiKey}`,
+          'Content-Type': 'application/json',
         },
-      );
-    }
+      },
+    );
   }
 
-  async executeFiatTransfer(settlement: Settlement): Promise<void> {
-    const partnerUrl = this.config.get('PARTNER_API_URL');
-    const partnerKey = this.config.get('PARTNER_API_KEY');
-    const payments = settlement.payments ?? [];
+  async processSettlement(settlementId: string): Promise<void> {
+    const settlement = await this.settlementsRepo.findOne({ where: { id: settlementId } });
+    if (!settlement) {
+      throw new NotFoundException(`Settlement ${settlementId} not found`);
+    }
 
-    if (payments.length === 0) {
-      throw new Error(`Settlement ${settlement.id} has no linked payments`);
+    if (settlement.status !== SettlementStatus.PROCESSING) {
+      this.logger.warn(`Settlement ${settlementId} is not in PROCESSING state; skipping`);
+      return;
     }
 
     try {
-      const response = await axios.post(
-        `${partnerUrl}/transfers`,
-        {
-          amount: settlement.netAmountUsd,
-          currency: 'USD',
-          merchantId: settlement.merchantId,
-          reference: settlement.id,
-        },
-        { headers: { Authorization: `Bearer ${partnerKey}` } },
-      );
-
+      await this.executeFiatTransfer(settlement);
       settlement.status = SettlementStatus.COMPLETED;
-      settlement.partnerReference = response.data?.reference;
       settlement.completedAt = new Date();
       await this.settlementsRepo.save(settlement);
-
-      await this.settleSettlementPayments(settlement);
-    } catch (err) {
-      this.logger.error(`Settlement failed for ${settlement.id}`, err.message);
+      this.invalidateAnalyticsForMerchant(settlement.merchantId);
+      await this.webhooks.dispatch(settlement.merchantId, 'settlement.completed', {
+        settlementId: settlement.id,
+      });
+    } catch (error) {
+      this.logger.error(`Settlement ${settlementId} failed: ${(error as Error).message}`);
+      settlement.status = SettlementStatus.FAILED;
+      settlement.failureReason = (error as Error).message;
+      await this.settlementsRepo.save(settlement);
+      this.invalidateAnalyticsForMerchant(settlement.merchantId);
       await this.adminAlerts.raise({
         type: AdminAlertType.SETTLEMENT_FAILURE,
-        dedupeKey: `settlement:${settlement.id}`,
-        message: `Settlement failed for ${settlement.id}: ${err.message}`,
-        metadata: {
-          merchantId: settlement.merchantId,
-          paymentIds: payments.map((payment) => payment.id),
-        },
+        dedupeKey: `settlement-failed:${settlement.id}`,
+        message: `Settlement ${settlement.id} failed: ${(error as Error).message}`,
+        metadata: { merchantId: settlement.merchantId },
         thresholdValue: 1,
       });
-
-      settlement.status = SettlementStatus.FAILED;
-      settlement.failureReason = err.message;
-      await this.settlementsRepo.save(settlement);
-
-      for (const payment of payments) {
-        payment.status = PaymentStatus.FAILED;
-        await this.paymentsRepo.save(payment);
-      }
-
-      for (const payment of payments) {
-        await this.webhooks.dispatch(settlement.merchantId, 'payment.failed', {
-          paymentId: payment.id,
-          reason: err.message,
-        });
-
-        await this.sendSettlementEmail(
-          settlement.merchantId,
-          NotificationEventType.SETTLEMENT_FAILED,
-          'payment-failed',
-          {
-            settlementId: settlement.id,
-            paymentId: payment.id,
-            reason: err.message,
-          },
-        );
-      }
+      throw error;
     }
   }
 
-  async findAll(merchantId: string, page = 1, limit = 20) {
-    const [data, total] = await this.settlementsRepo.findAndCount({
-      where: { merchantId },
+  async approveSettlement(settlementId: string, adminId: string): Promise<Settlement> {
+    const settlement = await this.settlementsRepo.findOne({ where: { id: settlementId } });
+    if (!settlement) {
+      throw new NotFoundException(`Settlement ${settlementId} not found`);
+    }
+
+    if (settlement.status !== SettlementStatus.PENDING_APPROVAL) {
+      throw new Error(`Settlement ${settlementId} is not awaiting approval`);
+    }
+
+    settlement.status = SettlementStatus.PROCESSING;
+    settlement.approvedBy = adminId;
+    settlement.approvedAt = new Date();
+    const saved = await this.settlementsRepo.save(settlement);
+
+    await this.enqueueSettlement(saved.id);
+    return saved;
+  }
+
+  async rejectSettlement(settlementId: string, adminId: string, reason: string): Promise<Settlement> {
+    const settlement = await this.settlementsRepo.findOne({ where: { id: settlementId } });
+    if (!settlement) {
+      throw new NotFoundException(`Settlement ${settlementId} not found`);
+    }
+
+    settlement.status = SettlementStatus.REJECTED;
+    settlement.rejectedBy = adminId;
+    settlement.rejectedAt = new Date();
+    settlement.rejectionReason = reason;
+    return this.settlementsRepo.save(settlement);
+  }
+
+  async findForMerchant(
+    merchantId: string,
+    options: FindManyOptions<Settlement> = {},
+  ): Promise<Settlement[]> {
+    return this.settlementsRepo.find({
+      ...options,
+      where: { ...(options.where as object), merchantId },
+      order: options.order ?? { createdAt: 'DESC' },
+    });
+  }
+
+  async findOneForMerchant(merchantId: string, settlementId: string): Promise<Settlement> {
+    const settlement = await this.settlementsRepo.findOne({
+      where: { id: settlementId, merchantId },
+    });
+    if (!settlement) {
+      throw new NotFoundException(`Settlement ${settlementId} not found`);
+    }
+    return settlement;
+  }
+
+  async findForAdmin(query: AdminSettlementsQueryDto): Promise<PaginatedResponseDto<Settlement>> {
+    const { page = 1, limit = 20, status, merchantId, from, to } = query;
+    const where: Record<string, unknown> = {};
+    if (status) where.status = status;
+    if (merchantId) where.merchantId = merchantId;
+    if (from && to) where.createdAt = Between(new Date(from), new Date(to));
+
+    const [items, total] = await this.settlementsRepo.findAndCount({
+      where,
       order: { createdAt: 'DESC' },
       skip: (page - 1) * limit,
       take: limit,
     });
 
-    return PaginatedResponseDto.of(data, total, page, limit);
+    return {
+      items,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
   }
 
   async handlePartnerCallback(payload: PartnerCallbackPayload): Promise<void> {
-    const settlement = await this.settlementsRepo.findOne({
-      where: { id: payload.reference },
-      relations: ['payments'],
-    });
-
+    const settlement = await this.settlementsRepo.findOne({ where: { id: payload.reference } });
     if (!settlement) {
-      this.logger.warn(`Partner callback for unknown settlement reference: ${payload.reference}`);
+      this.logger.warn(`Received partner callback for unknown settlement ${payload.reference}`);
       return;
     }
-
-    if (settlement.status === SettlementStatus.COMPLETED) {
-      this.logger.warn(`Duplicate partner callback for already-completed settlement ${settlement.id}; ignoring.`);
-      return;
-    }
-
-    const payments = settlement.payments ?? [];
 
     if (payload.status === 'success') {
       settlement.status = SettlementStatus.COMPLETED;
       settlement.completedAt = new Date();
-      await this.settlementsRepo.save(settlement);
-
-      await this.settleSettlementPayments(settlement);
     } else {
       settlement.status = SettlementStatus.FAILED;
       settlement.failureReason = payload.failureReason ?? 'Partner reported failure';
-      await this.settlementsRepo.save(settlement);
-
-      for (const payment of payments) {
-        payment.status = PaymentStatus.FAILED;
-        await this.paymentsRepo.save(payment);
-      }
-
-      for (const payment of payments) {
-        await this.webhooks.dispatch(settlement.merchantId, 'payment.failed', {
-          paymentId: payment.id,
-          reason: settlement.failureReason,
-        });
-
-        await this.sendSettlementEmail(
-          settlement.merchantId,
-          NotificationEventType.SETTLEMENT_FAILED,
-          'payment-failed',
-          {
-            settlementId: settlement.id,
-            paymentId: payment.id,
-            reason: settlement.failureReason,
-          },
-        );
-      }
-    }
-  }
-
-  /**
-   * Sends an email for a settlement event only if the merchant has that
-   * channel+event combination enabled in their notification preferences.
-   */
-  private async sendSettlementEmail(
-    merchantId: string,
-    eventType: NotificationEventType,
-    templateAlias: string,
-    mergeData: Record<string, unknown>,
-  ): Promise<void> {
-    const emailEnabled = await this.notificationPrefs.isEnabled(
-      merchantId,
-      NotificationChannel.EMAIL,
-      eventType,
-    );
-    if (!emailEnabled) return;
-
-    try {
-      const merchant = await this.merchantsService.findOne(merchantId);
-      await this.emailService.queue(merchant.email, templateAlias, mergeData, merchantId);
-    } catch (err) {
-      this.logger.warn(`Failed to send settlement email for merchant ${merchantId}: ${err.message}`);
-    }
-  }
-
-  // Admin methods
-  async findAllAdmin(query: AdminSettlementsQueryDto) {
-    const { page = 1, limit = 20, status, merchantId, startDate, endDate, partnerReference, bankReference } = query;
-    
-    const whereConditions: any = {};
-    
-    if (status) {
-      whereConditions.status = status;
-    }
-    
-    if (merchantId) {
-      whereConditions.merchantId = merchantId;
-    }
-    
-    if (partnerReference) {
-      whereConditions.partnerReference = partnerReference;
-    }
-    
-    if (bankReference) {
-      whereConditions.bankReference = bankReference;
-    }
-    
-    if (startDate && endDate) {
-      whereConditions.createdAt = Between(new Date(startDate), new Date(endDate));
-    } else if (startDate) {
-      whereConditions.createdAt = Between(new Date(startDate), new Date());
-    } else if (endDate) {
-      whereConditions.createdAt = Between(new Date('1970-01-01'), new Date(endDate));
     }
 
-    const options: FindManyOptions<Settlement> = {
-      where: whereConditions,
-      relations: ['merchant', 'payments'],
-      order: { createdAt: 'DESC' },
-      skip: (page - 1) * limit,
-      take: limit,
-    };
-
-    const [data, total] = await this.settlementsRepo.findAndCount(options);
-
-    return PaginatedResponseDto.of(data, total, page, limit);
-  }
-
-  async retrySettlement(id: string): Promise<{ success: boolean; message: string }> {
-    const settlement = await this.settlementsRepo.findOne({
-      where: { id },
-      relations: ['payments'],
-    });
-
-    if (!settlement) {
-      return { success: false, message: 'Settlement not found' };
-    }
-
-    if (settlement.status !== SettlementStatus.FAILED) {
-      return { success: false, message: 'Only failed settlements can be retried' };
-    }
-
-    // Reset settlement status and clear failure reason
-    settlement.status = SettlementStatus.PROCESSING;
-    settlement.failureReason = null;
-    settlement.partnerReference = null;
-    settlement.completedAt = null;
     await this.settlementsRepo.save(settlement);
-
-    // Update associated payments
-    for (const payment of settlement.payments) {
-      payment.status = PaymentStatus.SETTLING;
-      await this.paymentsRepo.save(payment);
-    }
-
-    // Retry the fiat transfer
-    if (settlement.payments.length > 0) {
-      await this.enqueueSettlement(settlement.id);
-    }
-
-    this.logger.log(`Settlement ${id} retry initiated by admin`);
-    return { success: true, message: 'Settlement retry initiated' };
-  }
-
-  async approveSettlement(id: string, approvedBy: string): Promise<{ success: boolean; message: string }> {
-    const settlement = await this.settlementsRepo.findOne({
-      where: { id },
-      relations: ['payments'],
-    });
-
-    if (!settlement) {
-      return { success: false, message: 'Settlement not found' };
-    }
-
-    if (settlement.status !== SettlementStatus.PENDING_APPROVAL) {
-      return { success: false, message: 'Only settlements pending approval can be approved' };
-    }
-
-    if (!settlement.requiresApproval) {
-      return { success: false, message: 'Settlement does not require manual approval' };
-    }
-
-    // Approve and process the settlement
-    settlement.status = SettlementStatus.PROCESSING;
-    settlement.approvedAt = new Date();
-    settlement.approvedBy = approvedBy;
-    await this.settlementsRepo.save(settlement);
-
-    // Update associated payments
-    for (const payment of settlement.payments) {
-      payment.status = PaymentStatus.SETTLING;
-      await this.paymentsRepo.save(payment);
-    }
-
-    // Execute the fiat transfer
-    if (settlement.payments.length > 0) {
-      await this.enqueueSettlement(settlement.id);
-    }
-
-    this.logger.log(`Large settlement ${id} approved and processed by admin`);
-    return { success: true, message: 'Settlement approved and processing initiated' };
-  }
-
-  async applySorobanSettlementCompleted(event: { settlementId: string; partnerReference?: string }): Promise<void> {
-    const settlement = await this.settlementsRepo.findOne({
-      where: { id: event.settlementId },
-      relations: ['payments'],
-    });
-
-    if (!settlement) {
-      this.logger.warn(`Soroban settlement completed for unknown settlement ${event.settlementId}`);
-      return;
-    }
-
-    if (settlement.status === SettlementStatus.COMPLETED) {
-      return;
-    }
-
-    settlement.status = SettlementStatus.COMPLETED;
-    settlement.completedAt = new Date();
-    if (event.partnerReference) {
-      settlement.partnerReference = event.partnerReference;
-    }
-    await this.settlementsRepo.save(settlement);
-
-    const payments = settlement.payments ?? [];
-    for (const payment of payments) {
-      payment.status = PaymentStatus.SETTLED;
-      await this.paymentsRepo.save(payment);
-    }
-
     this.invalidateAnalyticsForMerchant(settlement.merchantId);
 
-    for (const payment of payments) {
-      await this.webhooks.dispatch(settlement.merchantId, 'payment.settled', {
-        paymentId: payment.id,
-        settlementId: settlement.id,
-        amount: payment.amountUsd,
-      });
+    await this.webhooks.dispatch(settlement.merchantId, `settlement.${payload.status}`, {
+      settlementId: settlement.id,
+    });
 
-      await this.sendSettlementEmail(
-        settlement.merchantId,
-        NotificationEventType.PAYMENT_SETTLED,
-        'settlement-completed',
-        {
-          settlementId: settlement.id,
-          netAmountUsd: Number(settlement.netAmountUsd).toFixed(2),
-          paymentId: payment.id,
-        },
-      );
-    }
+    await this.emailService.sendSettlementStatusEmail(settlement.merchantId, settlement);
+
+    await this.notificationPrefs.notify(
+      settlement.merchantId,
+      NotificationEventType.SETTLEMENT_STATUS,
+      NotificationChannel.EMAIL,
+      { settlementId: settlement.id, status: settlement.status },
+    );
   }
 }

@@ -7,6 +7,7 @@ import type { Queue } from 'bull';
 import { CacheService } from '../cache/cache.service';
 import { DEFAULT_QUEUE_JOB, QUEUE_NAMES } from '../queues/queue.constants';
 import { CronJobService } from '../cron/cron-job.service';
+import { AdminAlertService } from '../admin/admin-alert.service';
 import {
   PaymentConfirmedEventDto,
   SettlementCompletedEventDto,
@@ -22,6 +23,8 @@ interface SorobanEventsResponse {
 const CURSOR_KEY = 'soroban:indexer:last-ledger';
 const CURSOR_TTL_SECONDS = 60 * 60 * 24 * 365;
 const PAGE_LIMIT = 200;
+const RPC_TIMEOUT_MS = 10_000;
+const MAX_SKIPPED_POLLS = 3;
 
 @Injectable()
 export class SorobanEventIndexer {
@@ -29,6 +32,7 @@ export class SorobanEventIndexer {
   private readonly rpcUrl: string;
   private readonly contractId: string;
   private polling = false;
+  private skippedPolls = 0;
 
   constructor(
     private readonly config: ConfigService,
@@ -36,6 +40,7 @@ export class SorobanEventIndexer {
     private readonly eventEmitter: EventEmitter2,
     @InjectQueue(QUEUE_NAMES.sorobanEventDlq) private readonly dlq: Queue,
     private readonly cronJobService: CronJobService,
+    private readonly adminAlertService: AdminAlertService,
   ) {
     this.rpcUrl = this.config.get<string>(
       'SOROBAN_RPC_URL',
@@ -50,7 +55,15 @@ export class SorobanEventIndexer {
   @Cron('*/5 * * * * *')
   async pollEvents(): Promise<void> {
     if (this.polling) {
+      this.skippedPolls++;
       this.logger.debug('Skipping poll: previous Soroban cycle still running');
+      if (this.skippedPolls > MAX_SKIPPED_POLLS) {
+        await this.adminAlertService.sendAlert({
+          severity: 'critical',
+          title: 'Soroban event indexer stalled',
+          message: `Soroban event indexing has been skipped ${this.skippedPolls} consecutive cycles because a previous poll is still in flight. On-chain event indexing may be halted.`,
+        });
+      }
       return;
     }
 
@@ -101,6 +114,7 @@ export class SorobanEventIndexer {
 
           return eventCount;
       });
+      this.skippedPolls = 0;
     } finally {
       this.polling = false;
     }
@@ -211,6 +225,7 @@ export class SorobanEventIndexer {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(RPC_TIMEOUT_MS),
     });
 
     if (!response.ok) {

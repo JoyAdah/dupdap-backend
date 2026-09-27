@@ -2,6 +2,12 @@ import { HttpStatus, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { CacheService } from '../cache/cache.service';
+import { AdminAlertService } from '../admin/admin-alert.service';
+
+export interface XlmUsdRate {
+  rate: number;
+  isFallback: boolean;
+}
 
 export class SorobanRpcException extends Error {
   constructor(
@@ -19,6 +25,7 @@ export class StellarService implements OnModuleInit {
   private readonly logger = new Logger(StellarService.name);
   private readonly exchangeRateCacheKey = 'exchange-rate:xlm-usd';
   private readonly exchangeRateTtlSeconds = 30;
+  private readonly lastKnownGoodRateKey = 'exchange-rate:xlm-usd:last-known-good';
   private server: StellarSdk.Horizon.Server;
   private sorobanRpcServer: StellarSdk.rpc.Server;
   private keypair: StellarSdk.Keypair;
@@ -29,6 +36,7 @@ export class StellarService implements OnModuleInit {
   constructor(
     private config: ConfigService,
     private readonly cacheService: CacheService,
+    private readonly adminAlertService: AdminAlertService,
   ) {}
 
   onModuleInit() {
@@ -72,8 +80,8 @@ export class StellarService implements OnModuleInit {
     return Math.random().toString(36).substring(2, 10).toUpperCase();
   }
 
-  async getXlmUsdRate(): Promise<number> {
-    const { value } = await this.cacheService.getOrSet<number>(
+  async getXlmUsdRate(): Promise<XlmUsdRate> {
+    const { value } = await this.cacheService.getOrSet<XlmUsdRate>(
       this.exchangeRateCacheKey,
       async () => {
         try {
@@ -81,18 +89,52 @@ export class StellarService implements OnModuleInit {
             .orderbook(StellarSdk.Asset.native(), this.usdcAsset)
             .call();
           const bestAsk = orderbook.asks[0];
-          if (bestAsk) return parseFloat(bestAsk.price);
+          if (bestAsk) {
+            const rate = parseFloat(bestAsk.price);
+            await this.cacheService.set(
+              this.lastKnownGoodRateKey,
+              rate,
+              24 * 60 * 60,
+            );
+            return { rate, isFallback: false };
+          }
 
-          return 0.1;
+          return this.resolveFallbackRate('empty orderbook');
         } catch (err) {
-          this.logger.warn('Failed to fetch XLM/USD rate, using fallback');
-          return 0.1;
+          return this.resolveFallbackRate(
+            err instanceof Error ? err.message : 'Horizon request failed',
+          );
         }
       },
       { ttlSeconds: this.exchangeRateTtlSeconds },
     );
 
     return value;
+  }
+
+  private async resolveFallbackRate(reason: string): Promise<XlmUsdRate> {
+    this.logger.warn(`Failed to fetch XLM/USD rate (${reason}), using fallback`);
+
+    const lastKnownGood = await this.cacheService.get<number>(
+      this.lastKnownGoodRateKey,
+    );
+
+    if (typeof lastKnownGood === 'number' && lastKnownGood > 0) {
+      await this.adminAlertService.sendAlert({
+        severity: 'warning',
+        title: 'XLM/USD rate fallback triggered',
+        message: `Horizon XLM/USD rate unavailable (${reason}); serving last-known-good rate ${lastKnownGood}.`,
+      });
+      return { rate: lastKnownGood, isFallback: true };
+    }
+
+    await this.adminAlertService.sendAlert({
+      severity: 'critical',
+      title: 'XLM/USD rate unavailable',
+      message: `Horizon XLM/USD rate unavailable (${reason}) and no last-known-good rate is cached.`,
+    });
+
+    return { rate: 0.1, isFallback: true };
   }
 
   async getAccountTransactions(
@@ -267,71 +309,14 @@ export class StellarService implements OnModuleInit {
     }
   }
 
-  /**
-   * Read-only query: calls get_balance(payment_id) on the escrow contract via
-   * simulateTransaction (no signing, no fee). Returns the on-chain remaining
-   * balance in stroops (i128 represented as bigint).
-   *
-   * Returns null when the contract ID is not configured or the simulation fails.
-   */
-  async queryContractBalance(paymentId: string): Promise<bigint | null> {
-    if (!this.sorobanContractId) return null;
-
-    try {
-      const contract = new StellarSdk.Contract(this.sorobanContractId);
-      // Build a minimal transaction — source account is not required to exist
-      // for simulation-only calls; we use a well-known testnet account as a
-      // placeholder when no keypair is configured.
-      const sourcePublicKey = this.keypair
-        ? this.keypair.publicKey()
-        : 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN';
-
-      const source = new StellarSdk.Account(sourcePublicKey, '0');
-      const tx = new StellarSdk.TransactionBuilder(source, {
-        fee: StellarSdk.BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(
-          contract.call(
-            'get_balance',
-            StellarSdk.nativeToScVal(paymentId, { type: 'bytes' }),
-          ),
-        )
-        .setTimeout(30)
-        .build();
-
-      const simulated = await this.sorobanRpcServer.simulateTransaction(tx);
-      if (StellarSdk.rpc.Api.isSimulationError(simulated)) {
-        this.logger.warn(
-          `get_balance simulation error for payment ${paymentId}: ${simulated.error}`,
-        );
-        return null;
-      }
-
-      const result = (simulated as StellarSdk.rpc.Api.SimulateTransactionSuccessResponse)
-        .result?.retval;
-      if (!result) return null;
-
-      // The contract returns i128; scValToNative converts it to bigint.
-      return BigInt(StellarSdk.scValToNative(result) as string | number | bigint);
-    } catch (err) {
-      this.logger.warn(
-        `queryContractBalance failed for payment ${paymentId}: ${(err as Error).message}`,
-      );
-      return null;
+  private extractSorobanErrorCode(error: unknown): string | undefined {
+    if (!error) return undefined;
+    if (typeof error === 'string') return error;
+    if (typeof error === 'object') {
+      const anyError = error as Record<string, any>;
+      if (typeof anyError.message === 'string') return anyError.message;
+      if (typeof anyError.error === 'string') return anyError.error;
     }
-  }
-
-  private extractSorobanErrorCode(error: unknown): string {
-    const serialized =
-      typeof error === 'string' ? error : JSON.stringify(error ?? {});
-    if (serialized.includes('tx_bad_auth')) return 'tx_bad_auth';
-    if (serialized.includes('tx_insufficient_fee')) return 'tx_insufficient_fee';
-    if (serialized.includes('tx_too_late')) return 'tx_too_late';
-    if (serialized.includes('host_fn_failed')) return 'host_fn_failed';
-    if (serialized.includes('resource_limit_exceeded')) {
-      return 'resource_limit_exceeded';
-    }
-    return 'soroban_rpc_error';
+    return undefined;
   }
 }

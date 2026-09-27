@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { v4 as uuidv4 } from 'uuid';
@@ -43,8 +43,28 @@ export class PaymentsService {
     private dataSource: DataSource,
   ) {}
 
+  /**
+   * Resolve the XLM/USD rate for customer-facing payment creation.
+   *
+   * getXlmUsdRate() now returns { rate, isFallback }. A fallback rate is a
+   * fabricated/stale constant and must never be used to quote a deposit
+   * amount, so we refuse the request instead of mispricing the payment.
+   */
+  private async resolveXlmRate(): Promise<number> {
+    const { rate, isFallback } = await this.stellar.getXlmUsdRate();
+    if (isFallback) {
+      this.logger.error(
+        'XLM/USD rate unavailable (Horizon failure or empty orderbook); refusing to quote a payment with a fallback rate',
+      );
+      throw new ServiceUnavailableException(
+        'Unable to fetch a live XLM/USD exchange rate. Please try again shortly.',
+      );
+    }
+    return rate;
+  }
+
   async create(merchantId: string, dto: CreatePaymentDto): Promise<Payment> {
-    const xlmRate = await this.stellar.getXlmUsdRate();
+    const xlmRate = await this.resolveXlmRate();
     const amountXlm = new Big(dto.amountUsd).div(xlmRate);
 
     const memo = this.stellar.generateMemo();
@@ -176,7 +196,7 @@ export class PaymentsService {
     }
 
     // ── Build all payment records in memory ───────────────────────────────────
-    const xlmRate = await this.stellar.getXlmUsdRate();
+    const xlmRate = await this.resolveXlmRate();
     const depositAddress = this.stellar.getDepositAddress();
     const now = Date.now();
 
@@ -219,7 +239,7 @@ export class PaymentsService {
         paymentId: payment.id,
         merchantId,
         amountUsd: item.amountUsd,
-        memo: item.memo,
+        memo,
         timestamp: new Date(),
       });
     }
@@ -237,6 +257,14 @@ export class PaymentsService {
     }
 
     return {
+      payments: saved.map((p) => ({
+        id: p.id,
+        reference: p.reference,
+        amountUsd: p.amountUsd,
+        amountXlm: p.amountXlm,
+        qrCode: p.qrCode,
+        expiresAt: p.expiresAt,
+      })),
       count: saved.length,
       payments: saved.map((p) => ({
         id: p.id,
@@ -249,11 +277,38 @@ export class PaymentsService {
   }
 
   async refund(
+    merchantId: string,
     paymentId: string,
     dto: RefundPaymentDto,
   ): Promise<Payment> {
-    const payment = await this.paymentsRepo.findOne({ where: { id: paymentId } });
+    const payment = await this.findOne(merchantId, paymentId);
+
+    if (payment.status !== PaymentStatus.CONFIRMED) {
+      throw new BadRequestException('Only confirmed payments can be refunded');
+    }
+
+    payment.status = PaymentStatus.REFUNDED;
+    paymen
     if (!payment) throw new NotFoundException('Payment not found');
+
+  async refund(
+    merchantId: string,
+    paymentId: string,
+    dto: RefundPaymentDto,
+  ): Promise<Payment> {
+    const payment = await this.findOne(merchantId, paymentId);
+    if (!payment) throw new NotFoundException('Payment not found');
+
+    if (payment.status !== PaymentStatus.CONFIRMED) {
+      throw new BadRequestException('Only confirmed payments can be refunded');
+    }
+
+    payment.status = PaymentStatus.REFUNDED;
+    payment.refundReason = dto.reason;
+    payment.refundedAt = new Date();
+    const saved = await this.paymentsRepo.save(payment);
+
+    this.analytics.clearCacheForMerchant(merchantId);
 
     if (payment.status !== PaymentStatus.CONFIRMED) {
       throw new BadRequestException('Only confirmed payments can be refunded');
@@ -273,6 +328,8 @@ export class PaymentsService {
       payment.refundedUsd >= payment.amountUsd
         ? PaymentStatus.REFUNDED
         : PaymentStatus.PARTIALLY_REFUNDED;
+    payment.refundReason = dto.reason;
+    payment.refundedAt = new Date();
 
     const saved = await this.paymentsRepo.save(payment);
 

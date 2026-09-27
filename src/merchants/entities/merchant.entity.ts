@@ -28,6 +28,25 @@ export enum MerchantRole {
   SUPERADMIN = 'superadmin',
 }
 
+/**
+ * Maps a merchant's country to the fiat currency used for its settlements.
+ * Falls back to USD for unknown/missing countries so settlements are never
+ * silently denominated in an unrelated currency.
+ */
+export const COUNTRY_SETTLEMENT_CURRENCY: Record<string, string> = {
+  NG: 'NGN',
+  US: 'USD',
+  GB: 'GBP',
+  AU: 'AUD',
+};
+
+export function settlementCurrencyForCountry(country?: string | null): string {
+  if (!country) {
+    return 'USD';
+  }
+  return COUNTRY_SETTLEMENT_CURRENCY[country.toUpperCase()] ?? 'USD';
+}
+
 @Entity('merchants')
 export class Merchant {
   @PrimaryGeneratedColumn('uuid')
@@ -48,6 +67,14 @@ export class Merchant {
 
   @Column({ nullable: true })
   country: string;
+
+  /**
+   * Fiat currency this merchant's settlements are denominated in.
+   * Derived from `country` when not explicitly set.
+   */
+  get settlementCurrency(): string {
+    return settlementCurrencyForCountry(this.country);
+  }
 
   @Transform(({ value }) => (value ? `****${String(value).slice(-4)}` : null))
   @Column({
