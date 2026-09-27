@@ -1,75 +1,95 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { RuntimeConfig } from './entities/runtime-config.entity';
+import { RuntimeConfig } from './runtime-config.entity';
 import { CacheService } from '../cache/cache.service';
-import { AuditService } from '../audit/audit.service';
 
 @Injectable()
 export class RuntimeConfigService {
-  private readonly CACHE_PREFIX = 'config:';
-  private readonly CACHE_TTL = 60; // 60 seconds
+  private readonly logger = new Logger(RuntimeConfigService.name);
+  private readonly CACHE_PREFIX = 'runtime-config:';
+  private readonly CACHE_TTL_SECONDS = 300;
 
   constructor(
     @InjectRepository(RuntimeConfig)
     private readonly configRepo: Repository<RuntimeConfig>,
-    private readonly cacheService: CacheService,
-    private readonly auditService: AuditService,
+    @Optional() private readonly cacheService?: CacheService,
   ) {}
 
   async get<T>(key: string, defaultValue?: T): Promise<T | undefined> {
     const cacheKey = `${this.CACHE_PREFIX}${key}`;
-    
+
     // 1. Try Redis
-    const cached = await this.cacheService.get<T>(cacheKey);
-    if (cached !== null) {
-      return cached;
+    if (this.cacheService) {
+      const cached = await this.cacheService.get<T>(cacheKey);
+      if (cached !== undefined) {
+        return cached;
+      }
     }
 
     // 2. Try DB
     const config = await this.configRepo.findOne({ where: { key } });
-    if (config) {
-      const value = config.value as T;
-      // Cache for 60s
-      await this.cacheService.set(cacheKey, value, this.CACHE_TTL);
-      return value;
+    if (!config) {
+      return defaultValue;
     }
 
-    // 3. Not in DB, return default
-    return defaultValue;
+    const value = this.parseValue<T>(config.value, config.type);
+
+    // 3. Populate cache for subsequent reads
+    if (this.cacheService) {
+      await this.cacheService.set(cacheKey, value, { ttlSeconds: this.CACHE_TTL_SECONDS });
+    }
+
+    return value;
   }
 
-  async set(key: string, value: any, adminId: string, description?: string): Promise<RuntimeConfig> {
-    try {
-      JSON.stringify(value);
-    } catch {
-      throw new BadRequestException('Invalid JSON value');
-    }
-
-    const cacheKey = `${this.CACHE_PREFIX}${key}`;
-
+  async set<T>(key: string, value: T, type?: string): Promise<RuntimeConfig> {
+    const serialized = this.serializeValue(value);
     let config = await this.configRepo.findOne({ where: { key } });
+
     if (config) {
-      config.value = value;
-      config.updatedBy = adminId;
-      if (description) config.description = description;
+      config.value = serialized;
+      if (type) config.type = type;
     } else {
-      config = this.configRepo.create({
-        key,
-        value,
-        updatedBy: adminId,
-        description,
-      });
+      config = this.configRepo.create({ key, value: serialized, type: type ?? 'string' });
     }
 
     const saved = await this.configRepo.save(config);
-    await this.cacheService.del(cacheKey);
-    await this.auditService.log(adminId, 'config.set', { key, value });
-
+    await this.invalidate(key);
     return saved;
   }
 
+  async invalidate(key: string): Promise<void> {
+    if (this.cacheService) {
+      await this.cacheService.del(`${this.CACHE_PREFIX}${key}`);
+    }
+  }
+
   async getAll(): Promise<RuntimeConfig[]> {
-    return this.configRepo.find({ order: { key: 'ASC' } });
+    return this.configRepo.find();
+  }
+
+  private parseValue<T>(raw: string, type: string): T {
+    switch (type) {
+      case 'number':
+        return Number(raw) as unknown as T;
+      case 'boolean':
+        return (raw === 'true') as unknown as T;
+      case 'json':
+        try {
+          return JSON.parse(raw) as T;
+        } catch {
+          this.logger.warn(`Failed to parse JSON runtime config value: ${raw}`);
+          return undefined as unknown as T;
+        }
+      default:
+        return raw as unknown as T;
+    }
+  }
+
+  private serializeValue(value: unknown): string {
+    if (typeof value === 'string') return value;
+    if (typeof value === 'object' && value !== null) return JSON.stringify(value);
+    return String(value);
   }
 }

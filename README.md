@@ -315,3 +315,8 @@ CI also runs migration safety/rollback checks, an uncommitted-migration check, a
 - Prometheus metrics + Grafana dashboards, Loki/Promtail log shipping — see the `dupdapp_stellar` repo's `grafana/` and `docker-compose.yml` for the local observability stack (backend log volume must be pointed at this repo's `logs/` directory if you wire that up locally).
 - Uptime/status page config: see `monitoring/` in `dupdapp_stellar`.
 - `AdminAlertService` pushes Slack/email alerts on repeated Stellar-monitor or settlement failures (`ADMIN_ALERT_*` env vars).
+
+## Handsoff notes
+
+<!-- handsoff-issue-340 -->
+- #340: RuntimeConfigService.get() passes a raw number instead of {ttlSeconds} to CacheService.set, silently caching config for 24h instead of 60s

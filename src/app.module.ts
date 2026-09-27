@@ -36,6 +36,9 @@ import { HttpMetricsInterceptor } from './prometheus/http-metrics.interceptor';
 
 import { MiddlewareConsumer, NestModule } from '@nestjs/common';
 import { CorrelationIdMiddleware } from './common/middleware/correlation-id.middleware';
+import { MaintenanceModeMiddleware } from './runtime-config/middleware/maintenance-mode.middleware';
+import { TlsEnforcementMiddleware } from './security/tls-enforcement.middleware';
+import { SensitiveAccessLogMiddleware } from './security/sensitive-access.middleware';
 import { CacheWarmupService } from './cache/cache-warmup.service';
 
 import { CacheModule } from '@nestjs/cache-manager';
@@ -172,5 +175,7 @@ import Redis from 'ioredis';
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
     consumer.apply(CorrelationIdMiddleware).forRoutes('*');
+    consumer.apply(MaintenanceModeMiddleware).forRoutes('*');
+    consumer.apply(TlsEnforcementMiddleware, SensitiveAccessLogMiddleware).forRoutes('*');
   }
 }
