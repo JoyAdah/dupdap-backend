@@ -5,22 +5,34 @@ const ENCRYPTED_PREFIX = 'encv1';
 const GCM_IV_BYTES = 12;
 const GCM_TAG_BYTES = 16;
 
+let diManagedInstance: EncryptionService | null = null;
+
 @Injectable()
 export class EncryptionService {
-  private static singleton: EncryptionService | null = null;
   private readonly logger = new Logger(EncryptionService.name);
   private readonly key: Buffer;
 
   constructor() {
     this.key = this.resolveKey();
-    EncryptionService.singleton = this;
+    diManagedInstance = this;
   }
 
-  static getSingleton(): EncryptionService {
-    if (!EncryptionService.singleton) {
-      EncryptionService.singleton = new EncryptionService();
+  /**
+   * Returns the Nest DI-managed instance of EncryptionService.
+   *
+   * TypeORM column transformers are plain functions with no access to Nest's
+   * DI container, so they need a way to reach the single DI-managed instance
+   * rather than constructing a parallel one. This reference is set once when
+   * Nest instantiates the service and is the only instance used for encryption
+   * and decryption across the app.
+   */
+  static getInstance(): EncryptionService {
+    if (!diManagedInstance) {
+      throw new Error(
+        'EncryptionService has not been initialized by the Nest DI container yet',
+      );
     }
-    return EncryptionService.singleton;
+    return diManagedInstance;
   }
 
   encrypt(plaintext: string): string {
