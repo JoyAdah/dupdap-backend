@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { CacheService } from '../cache/cache.service';
 import { AdminAlertService } from '../admin/admin-alert.service';
+import { StellarTxQueueService } from './stellar-tx-queue.service';
 
 export interface XlmUsdRate {
   rate: number;
@@ -37,6 +38,7 @@ export class StellarService implements OnModuleInit {
     private config: ConfigService,
     private readonly cacheService: CacheService,
     private readonly adminAlertService: AdminAlertService,
+    private readonly stellarTxQueue: StellarTxQueueService,
   ) {}
 
   onModuleInit() {
@@ -200,28 +202,7 @@ export class StellarService implements OnModuleInit {
     asset: StellarSdk.Asset,
     memo?: string,
   ): Promise<string> {
-    const account = await this.server.loadAccount(this.keypair.publicKey());
-
-    const txBuilder = new StellarSdk.TransactionBuilder(account, {
-      fee: StellarSdk.BASE_FEE,
-      networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(
-        StellarSdk.Operation.payment({
-          destination: destinationId,
-          asset,
-          amount,
-        }),
-      )
-      .setTimeout(30);
-
-    if (memo) txBuilder.addMemo(StellarSdk.Memo.text(memo));
-
-    const tx = txBuilder.build();
-    tx.sign(this.keypair);
-
-    const result = await this.server.submitTransaction(tx);
-    return result.hash;
+    return this.stellarTxQueue.submitPayment(destinationId, amount, asset, memo);
   }
 
   getUsdcAsset(): StellarSdk.Asset {

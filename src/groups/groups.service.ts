@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { randomBytes } from 'crypto';
 import { StellarService } from '../stellar/stellar.service';
+import { StellarTxQueueService } from '../stellar/stellar-tx-queue.service';
 import { GroupsRepository } from './groups.repository';
 import { Group } from './entities/group.entity';
 import { GroupMemberRole } from './entities/group-member.entity';
@@ -25,6 +26,7 @@ export class GroupsService {
   constructor(
     private readonly repo: GroupsRepository,
     private readonly stellarService: StellarService,
+    private readonly stellarTxQueue: StellarTxQueueService,
   ) {}
 
   // ── Create ──────────────────────────────────────────────────────────────────
@@ -179,33 +181,14 @@ export class GroupsService {
    * Syncs group creation on Stellar by submitting a manage_data operation
    * that records the group name on the treasury account as proof-of-creation.
    * Returns the transaction hash used as the on-chain group ID.
+   *
+   * Uses StellarTxQueueService to serialize submissions from the shared
+   * treasury account and avoid sequence number conflicts (tx_bad_seq).
    */
   private async syncOnChain(creatorId: string, groupName: string): Promise<string> {
-    const server = this.stellarService.getServer();
-    const secret = process.env.STELLAR_ACCOUNT_SECRET;
-    if (!secret) throw new Error('STELLAR_ACCOUNT_SECRET not configured');
-
-    const StellarSdk = await import('@stellar/stellar-sdk');
-    const keypair = StellarSdk.Keypair.fromSecret(secret);
-    const account = await server.loadAccount(keypair.publicKey());
-
-    const tx = new StellarSdk.TransactionBuilder(account, {
-      fee: StellarSdk.BASE_FEE,
-      networkPassphrase:
-        process.env.STELLAR_NETWORK_PASSPHRASE ?? StellarSdk.Networks.TESTNET,
-    })
-      .addOperation(
-        StellarSdk.Operation.manageData({
-          name: `group:${creatorId.slice(0, 8)}`,
-          value: groupName.slice(0, 64),
-        }),
-      )
-      .setTimeout(30)
-      .build();
-
-    tx.sign(keypair);
-    const result = await server.submitTransaction(tx);
-    return (result as any).hash as string;
+    const dataName = `group:${creatorId.slice(0, 8)}`;
+    const dataValue = groupName.slice(0, 64);
+    return this.stellarTxQueue.submitManageData(dataName, dataValue);
   }
 
   private async assertOwnerOrAdmin(groupId: string, userId: string): Promise<Group> {
