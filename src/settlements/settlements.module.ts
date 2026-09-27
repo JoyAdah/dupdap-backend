@@ -14,6 +14,7 @@ import { MerchantsModule } from '../merchants/merchants.module';
 import { StellarModule } from '../stellar/stellar.module';
 import { SettlementsSorobanListener } from './settlements-soroban.listener';
 import { AdminSettlementsController } from './admin-settlements.controller';
+import { RetryModule } from '../retry/retry.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { AdminSettlementsController } from './admin-settlements.controller';
     MerchantsModule,
     forwardRef(() => StellarModule),
     QueueModule,
+    RetryModule,
   ],
   controllers: [SettlementsController, PartnerCallbackController, AdminSettlementsController],
   providers: [SettlementsService, PartnerSignatureGuard, SettlementsSorobanListener],

@@ -6,6 +6,7 @@ import { EmailProcessor } from './email.processor';
 import { NodemailerService } from './nodemailer.service';
 import { EmailLog, EmailStatus } from './entities/email-log.entity';
 import { Job } from 'bull';
+import { RetryConfigService } from '../retry/retry-config.service';
 
 const mockLog: EmailLog = {
   id: 'log-1',
@@ -48,6 +49,13 @@ function makeJob(
 describe('EmailService', () => {
   let service: EmailService;
 
+  const mockRetryConfig = {
+    email: {
+      maxAttempts: 1,
+      delaysMs: [30_000],
+    },
+  };
+
   beforeEach(async () => {
     jest.clearAllMocks();
     const module: TestingModule = await Test.createTestingModule({
@@ -55,6 +63,7 @@ describe('EmailService', () => {
         EmailService,
         { provide: getRepositoryToken(EmailLog), useValue: mockRepo },
         { provide: getQueueToken(EMAIL_QUEUE), useValue: mockQueue },
+        { provide: RetryConfigService, useValue: mockRetryConfig },
       ],
     }).compile();
     service = module.get(EmailService);

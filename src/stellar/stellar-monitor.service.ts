@@ -16,6 +16,7 @@ import { ConfigService } from '@nestjs/config';
 import { Merchant } from '../merchants/entities/merchant.entity';
 import { NotificationPrefsService } from '../notifications/notification-prefs.service';
 import { NotificationChannel, NotificationEventType } from '../notifications/entities/notification-preference.entity';
+import { RetryConfigService } from '../retry/retry-config.service';
 
 @Injectable()
 export class StellarMonitorService implements OnModuleInit {
@@ -39,13 +40,21 @@ export class StellarMonitorService implements OnModuleInit {
     private notificationPrefs: NotificationPrefsService,
     private sorobanMonitor: SorobanMonitorService,
     @InjectQueue(QUEUE_NAMES.stellarMonitor) private monitorQueue: Queue,
+    private retryConfig: RetryConfigService,
   ) {}
 
   async onModuleInit(): Promise<void> {
+    const monitorRetry = this.retryConfig.stellarMonitor;
     await this.monitorQueue.add(
       'scan',
       {},
-      { repeat: { every: 30_000 }, jobId: 'stellar-monitor-repeat', removeOnComplete: true },
+      {
+        repeat: { every: 30_000 },
+        jobId: 'stellar-monitor-repeat',
+        removeOnComplete: true,
+        attempts: monitorRetry.maxAttempts + 1,
+        backoff: { type: 'fixed', delay: monitorRetry.delaysMs[0] ?? 0 },
+      },
     );
     this.logger.log('Stellar monitor Bull job scheduled every 30 seconds');
   }

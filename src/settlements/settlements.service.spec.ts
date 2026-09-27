@@ -12,12 +12,20 @@ import { NotificationPrefsService } from '../notifications/notification-prefs.se
 import { StellarService } from '../stellar/stellar.service';
 import { AnalyticsService } from '../analytics/analytics.service';
 import { CronJobService } from '../cron/cron-job.service';
+import { RetryConfigService } from '../retry/retry-config.service';
 
 describe('SettlementsService batching', () => {
   let service: SettlementsService;
   let settlementsRepo: any;
   let paymentsRepo: any;
   let settlementQueue: any;
+
+  const mockRetryConfig = {
+    settlement: {
+      maxAttempts: 3,
+      delaysMs: [60_000, 300_000, 1_800_000],
+    },
+  };
 
   const deps = () => ({
     config: { get: jest.fn() } as unknown as ConfigService,
@@ -66,6 +74,7 @@ describe('SettlementsService batching', () => {
       deps().stellar,
       settlementQueue as any,
       { run: jest.fn() } as unknown as CronJobService,
+      mockRetryConfig as unknown as RetryConfigService,
     );
 
     jest.restoreAllMocks();
@@ -143,7 +152,11 @@ describe('SettlementsService batching', () => {
     );
     expect(paymentsRepo.save).toHaveBeenCalledTimes(3);
     expect(settlementQueue.add).toHaveBeenCalledTimes(1);
-    expect(settlementQueue.add).toHaveBeenCalledWith('dispatch', { settlementId: 'settlement-1' });
+    expect(settlementQueue.add).toHaveBeenCalledWith(
+      'dispatch',
+      { settlementId: 'settlement-1' },
+      expect.objectContaining({ attempts: 4 }), // maxAttempts(3) + 1
+    );
     expect((payments[0] as Payment).status).toBe(PaymentStatus.SETTLING);
     expect((payments[1] as Payment).status).toBe(PaymentStatus.SETTLING);
     expect((payments[2] as Payment).status).toBe(PaymentStatus.SETTLING);
@@ -233,6 +246,7 @@ describe('SettlementsService cache invalidation', () => {
       deps().stellar,
       settlementQueue as any,
       { run: jest.fn() } as unknown as CronJobService,
+      mockRetryConfig as unknown as RetryConfigService,
     );
 
     analytics = deps().analytics;
@@ -368,6 +382,7 @@ describe('SettlementsService executeFiatTransfer', () => {
       stellar,
       settlementQueue as any,
       { run: jest.fn() } as unknown as CronJobService,
+      mockRetryConfig as unknown as RetryConfigService,
     );
 
     jest.restoreAllMocks();
@@ -490,6 +505,7 @@ describe('SettlementsService handlePartnerCallback', () => {
       stellar,
       settlementQueue as any,
       { run: jest.fn() } as unknown as CronJobService,
+      mockRetryConfig as unknown as RetryConfigService,
     );
 
     jest.restoreAllMocks();
@@ -629,6 +645,7 @@ describe('SettlementsService admin methods', () => {
       d.stellar,
       settlementQueue as any,
       { run: jest.fn() } as unknown as CronJobService,
+      mockRetryConfig as unknown as RetryConfigService,
     );
 
     jest.restoreAllMocks();
@@ -674,7 +691,11 @@ describe('SettlementsService admin methods', () => {
       expect(settlement.status).toBe(SettlementStatus.PROCESSING);
       expect(settlement.failureReason).toBeNull();
       expect(payment.status).toBe(PaymentStatus.SETTLING);
-      expect(settlementQueue.add).toHaveBeenCalledWith('dispatch', { settlementId: 's1' });
+      expect(settlementQueue.add).toHaveBeenCalledWith(
+        'dispatch',
+        { settlementId: 's1' },
+        expect.objectContaining({ attempts: 4 }),
+      );
     });
 
     it('rejects retry for non-failed settlement', async () => {
@@ -721,7 +742,11 @@ describe('SettlementsService admin methods', () => {
       expect(settlement.approvedBy).toBe('admin-user-42');
       expect(settlement.approvedAt).toBeInstanceOf(Date);
       expect(payment.status).toBe(PaymentStatus.SETTLING);
-      expect(settlementQueue.add).toHaveBeenCalledWith('dispatch', { settlementId: 's1' });
+      expect(settlementQueue.add).toHaveBeenCalledWith(
+        'dispatch',
+        { settlementId: 's1' },
+        expect.objectContaining({ attempts: 4 }),
+      );
     });
 
     it('rejects approval for non-pending-approval settlement', async () => {

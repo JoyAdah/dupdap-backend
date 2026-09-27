@@ -22,6 +22,7 @@ import { NotificationChannel, NotificationEventType } from '../notifications/ent
 import { StellarService } from '../stellar/stellar.service';
 import { AnalyticsService } from '../analytics/analytics.service';
 import { CronJobService } from '../cron/cron-job.service';
+import { RetryConfigService } from '../retry/retry-config.service';
 
 export interface PartnerCallbackPayload {
   reference: string;
@@ -69,6 +70,7 @@ export class SettlementsService {
     @InjectQueue(QUEUE_NAMES.settlement)
     private settlementQueue: Queue,
     private cronJobService: CronJobService,
+    private retryConfig: RetryConfigService,
   ) {}
 
   private invalidateAnalyticsForMerchant(merchantId: string): void {
@@ -159,7 +161,12 @@ export class SettlementsService {
   }
 
   private async enqueueSettlement(settlementId: string): Promise<void> {
-    await this.settlementQueue.add(DEFAULT_QUEUE_JOB, { settlementId });
+    const settlementRetry = this.retryConfig.settlement;
+    await this.settlementQueue.add(DEFAULT_QUEUE_JOB, { settlementId }, {
+      attempts: settlementRetry.maxAttempts + 1,
+      backoff: { type: 'fixed', delay: settlementRetry.delaysMs[0] ?? 60_000 },
+      removeOnFail: false,
+    });
   }
 
   @Cron('0 */15 * * * *')

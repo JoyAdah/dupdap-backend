@@ -8,12 +8,14 @@ import { EmailProcessor } from './email.processor';
 import { NodemailerService } from './nodemailer.service';
 import { EmailAdminController } from './email-admin.controller';
 import { emailConfig } from '../config/email.config';
+import { RetryModule } from '../retry/retry.module';
 
 @Module({
   imports: [
     ConfigModule.forFeature(emailConfig),
     TypeOrmModule.forFeature([EmailLog]),
     BullModule.registerQueue({ name: EMAIL_QUEUE }),
+    RetryModule,
   ],
   providers: [EmailService, EmailProcessor, NodemailerService],
   controllers: [EmailAdminController],

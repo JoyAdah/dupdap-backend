@@ -4,6 +4,7 @@ import { Repository } from 'typeorm';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { EmailLog, EmailStatus } from './entities/email-log.entity';
+import { RetryConfigService } from '../retry/retry-config.service';
 
 export const EMAIL_QUEUE = 'email-jobs';
 
@@ -23,6 +24,7 @@ export class EmailService {
     private readonly logRepo: Repository<EmailLog>,
     @InjectQueue(EMAIL_QUEUE)
     private readonly emailQueue: Queue<EmailJobPayload>,
+    private readonly retryConfig: RetryConfigService,
   ) {}
 
   async queue(
@@ -41,11 +43,13 @@ export class EmailService {
       }),
     );
 
+    const emailRetry = this.retryConfig.email;
+
     await this.emailQueue.add(
       { logId: log.id, to, templateAlias, mergeData },
       {
-        attempts: 2,          // 1 initial attempt + 1 retry
-        backoff: { type: 'fixed', delay: 30_000 },
+        attempts: emailRetry.maxAttempts + 1,
+        backoff: { type: 'fixed', delay: emailRetry.delaysMs[0] ?? 30_000 },
         removeOnComplete: true,
         removeOnFail: false,
       },
