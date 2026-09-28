@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { randomBytes } from 'crypto';
 import { StellarService } from '../stellar/stellar.service';
+import { BlockchainWalletService } from '../blockchain-wallet/blockchain-wallet.service';
 import { GroupsRepository } from './groups.repository';
 import { Group } from './entities/group.entity';
 import { GroupMemberRole } from './entities/group-member.entity';
@@ -25,6 +26,7 @@ export class GroupsService {
   constructor(
     private readonly repo: GroupsRepository,
     private readonly stellarService: StellarService,
+    private readonly blockchainWalletService: BlockchainWalletService,
   ) {}
 
   // ── Create ──────────────────────────────────────────────────────────────────
@@ -233,7 +235,10 @@ export class GroupsService {
     }
 
     if (group.isTokenGated && group.gateTokenAddress && group.gateMinBalance != null) {
-      await this.verifyTokenGate(userId, group.gateTokenAddress, group.gateMinBalance);
+      // Fetch the user's Stellar public key from their blockchain wallet
+      const wallet = await this.blockchainWalletService.getWallet(userId);
+      const stellarAccountId = wallet.stellarAddress;
+      await this.verifyTokenGate(stellarAccountId, group.gateTokenAddress, group.gateMinBalance);
     }
   }
 
