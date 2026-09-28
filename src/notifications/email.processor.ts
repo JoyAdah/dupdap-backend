@@ -19,6 +19,19 @@ interface EmailJobPayload {
   html?: string;
 }
 
+/**
+ * @deprecated This processor is part of the legacy notifications email path.
+ *
+ * The canonical email-sending path is `src/email/email.processor.ts`
+ * (`@Processor(EMAIL_QUEUE)`), driven by `EmailService.queue()` and logging to
+ * `EmailLog`. New features MUST enqueue through `EmailService` instead of
+ * `NotificationsService.enqueueEmail()`.
+ *
+ * This class is retained only to drain any in-flight jobs still sitting on the
+ * `EMAIL_DELIVERY_QUEUE` during the migration window. Once the queue is empty
+ * and all callers have been migrated, this file (and its queue wiring) can be
+ * deleted.
+ */
 @Injectable()
 @Processor(EMAIL_DELIVERY_QUEUE)
 export class EmailProcessor {
@@ -102,12 +115,14 @@ export class EmailProcessor {
       return;
     }
 
-    const host = this.configService.get<string>("SMTP_HOST");
-    const port = Number(this.configService.get<number>("SMTP_PORT", 587));
+    const host = this.configService.get<string>("EMAIL_SMTP_HOST");
+    const port = Number(
+      this.configService.get<number>("EMAIL_SMTP_PORT", 587),
+    );
     const secure =
-      this.configService.get<string>("SMTP_SECURE", "false") === "true";
-    const user = this.configService.get<string>("SMTP_USER");
-    const pass = this.configService.get<string>("SMTP_PASS");
+      this.configService.get<string>("EMAIL_SMTP_SECURE", "false") === "true";
+    const user = this.configService.get<string>("EMAIL_SMTP_USER");
+    const pass = this.configService.get<string>("EMAIL_SMTP_PASS");
 
     if (!host || !user || !pass) {
       throw new Error("SMTP configuration is incomplete");

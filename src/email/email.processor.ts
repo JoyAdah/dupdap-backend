@@ -7,6 +7,17 @@ import { EmailLog, EmailStatus } from './entities/email-log.entity';
 import { NodemailerService } from './nodemailer.service';
 import { EMAIL_QUEUE, EmailJobPayload } from './email.service';
 
+/**
+ * Canonical email processor.
+ *
+ * This is the single email-sending processor for the application. All email
+ * flows must enqueue through `EmailService.queue(...)` (queue `EMAIL_QUEUE`),
+ * which renders Handlebars templates via `NodemailerService` and records
+ * delivery state in the `EmailLog` entity. The former parallel implementation
+ * in `src/notifications/email.processor.ts` (queue `EMAIL_DELIVERY_QUEUE`,
+ * `EmailDeliveryLog`) has been removed; callers such as `AmlService` and
+ * `AnalyticsExportService` now route through this path.
+ */
 @Processor(EMAIL_QUEUE)
 export class EmailProcessor {
   private readonly logger = new Logger(EmailProcessor.name);
