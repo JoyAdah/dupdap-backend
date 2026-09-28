@@ -40,9 +40,6 @@ export class GroupsService {
       onChainId = await this.syncOnChain(userId, dto.name);
     } catch (err: any) {
       this.logger.warn(`On-chain group sync failed: ${err.message}`);
-      throw new BadRequestException(
-        `On-chain group creation failed: ${err.message}`,
-      );
     }
 
     const group = this.repo.create({
