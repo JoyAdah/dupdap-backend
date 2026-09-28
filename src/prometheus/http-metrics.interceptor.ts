@@ -20,12 +20,14 @@ interface ExpressResponseLike {
   statusCode?: number;
 }
 
+const UNMATCHED_ROUTE_LABEL = 'unmatched';
+
 function resolveRoute(req: ExpressRequestWithRoute): string {
   const routePath = req.route?.path;
   if (routePath && typeof routePath === 'string') {
     return routePath;
   }
-  return req.originalUrl ?? req.url ?? 'unknown';
+  return UNMATCHED_ROUTE_LABEL;
 }
 
 function resolveStatusFromError(err: unknown): number {
@@ -93,4 +95,3 @@ export class HttpMetricsInterceptor implements NestInterceptor {
     );
   }
 }
-

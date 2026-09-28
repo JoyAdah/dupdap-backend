@@ -12,6 +12,7 @@ export enum AdminAlertType {
   SETTLEMENT_FAILURE = 'settlement_failure',
   WEBHOOK_FAILURE = 'webhook_failure',
   BACKUP_FAILURE = 'backup_failure',
+  DB_POOL_EXHAUSTED = 'db_pool_exhausted',
 }
 
 export enum AdminAlertStatus {

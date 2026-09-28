@@ -4,7 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { Repository, MoreThanOrEqual } from 'typeorm';
 import { AmlFlag, AmlFlagReason, AmlFlagStatus } from './entities/aml-flag.entity';
 import { Payment } from '../payments/entities/payment.entity';
-import { NotificationsService } from '../notifications/notifications.service';
+import { EmailService } from '../email/email.service';
 
 const HIGH_VALUE_THRESHOLD_USD = 10_000;
 const HIGH_VELOCITY_LIMIT = 50;
@@ -18,7 +18,7 @@ export class AmlService {
     private amlRepo: Repository<AmlFlag>,
     @InjectRepository(Payment)
     private paymentsRepo: Repository<Payment>,
-    private readonly notificationsService: NotificationsService,
+    private readonly emailService: EmailService,
     private readonly configService: ConfigService,
   ) {}
 
@@ -57,10 +57,16 @@ export class AmlService {
     // so AML alerts actually send in environments configured per .env.example / README.
     const adminEmail = this.configService.get<string>('ADMIN_ALERT_EMAIL');
     if (adminEmail) {
-      await this.notificationsService.enqueueEmail({
-        recipient: adminEmail,
+      await this.emailService.queue({
+        to: adminEmail,
         subject: `[AML Alert] New flag: ${reason}`,
-        text: `A new AML flag has been raised.\n\nReason: ${reason}\nMerchant ID: ${merchantId}\nPayment ID: ${paymentId}\nDetails: ${JSON.stringify(metadata, null, 2)}\n\nPlease review at /admin/aml.`,
+        template: 'aml-alert',
+        context: {
+          reason,
+          merchantId,
+          paymentId,
+          metadata,
+        },
       });
     } else {
       this.logger.warn(
