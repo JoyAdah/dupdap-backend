@@ -15,7 +15,7 @@ export enum EmailStatus {
 
 @Entity('email_logs')
 @Index('IDX_email_logs_status', ['status'])
-@Index('IDX_email_logs_user_id', ['user_id'])
+@Index('IDX_email_logs_user_id', ['userId'])
 export class EmailLog {
   @PrimaryGeneratedColumn('uuid')
   id: string;
